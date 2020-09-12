@@ -1,4 +1,5 @@
 from django.apps import apps
+from django.core.exceptions import ImproperlyConfigured
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from openpyxl import load_workbook
@@ -114,7 +115,6 @@ Examples:
                 for f in modeldefinitions[model]["fields"].values():
                     f["is_natural_key"] = True
 
-        # TODO: create correct order so that referenced objects are created first
         with transaction.atomic():
             for r in rowranges:
                 for row in worksheet.iter_rows(min_row=r[0], max_row=r[1]):
@@ -122,7 +122,7 @@ Examples:
                     rowcontext = {
                         get_column_letter(i): c.value for i, c in enumerate(row, 1)
                     }
-                    for model in modeldefinitions:
+                    for model in model_import_order(modeldefinitions):
                         created = importinstance(modeldefinitions[model], rowcontext)
                         modeldefinitions[model]["processed"] += 1
                         if created:
@@ -181,6 +181,20 @@ def range_overlap(start1, end1, start2, end2):
         or contains(start2, end2, start1)
         or contains(start2, end2, end1)
     )
+
+
+def model_import_order(modeldefinitions):
+    if has_dependency_cycle(modeldefinitions):
+        raise ImproperlyConfigured(
+            "The import definition contains a cycle of foreign keys which is not allowed"
+        )
+    # TODO: implement
+    return modeldefinitions.keys()
+
+
+def has_dependency_cycle(modeldefinitions):
+    # TODO: implement
+    return False
 
 
 def try_int(v, default=None):
