@@ -1,9 +1,14 @@
 from django.apps import apps
-from django.core.exceptions import ImproperlyConfigured
+from django.contrib.contenttypes.fields import GenericRelation
 from django.core.management.base import BaseCommand
-from django.db import transaction
+from django.db import models, transaction
+from django.forms.models import model_to_dict
 from openpyxl import load_workbook
 from openpyxl.utils.cell import get_column_letter
+
+
+class IgnoreObject(Exception):
+    pass
 
 
 class Command(BaseCommand):
@@ -22,7 +27,7 @@ Examples:
 --rows 2:-1 # All rows except the first and the last one
 
 rows can be specified multiple times, all specified ranges will be imported.
-If no arguemnt for rows is given all rows will be imported
+If no argument for rows is given all rows will be imported
 """,
         )
 
@@ -43,9 +48,12 @@ If the field should be used as component of the natural key the character + shou
 
 The FIELD-SPECIFICATION must be unique over all --field arguments except for One-To-Many or Many-To-Many fields.
 
-The value of VALUE-EXPRESSION will be evaluated as python expression. All columns are available as variables with the according volumn name like A, B, AA, etc. Apart from the python builtins there are a few helper functions help with transformations:
-    ref(<VALUE>, <APP_NAME>.<MODEL_NAME>.<FIELD1_NAME>.<FIELD2_NAME>) # converts the given VALUE into a reference to <APP_NAME>.<MODEL_NAME> using the <FIELD_NAME>s as natural to look up the object.
-    map(<INPUT>, <SRC>, <DST>) # Returns DST if INPUT == SRC otherwise returns INPUT
+The value of VALUE-EXPRESSION will be evaluated as python expression.
+All columns are available as variables with the according volumn name like A, B, AA, etc.
+If the column value is a string, whitespace will be stripped.
+Apart from the python builtins there are a few helper functions help with transformations:
+    ref(<APP_NAME>.<MODEL_NAME>, <FIELD1_NAME>=<VALUE1>, <FIELD2_NAME>=<VALUE2>) # converts the given VALUEs into a reference to <APP_NAME>.<MODEL_NAME> passing all arguments to the get-method of the manager.
+    vmap(<INPUT>, (<SRC>, <DST>), ...) # Returns first DST[i] where INPUT == SRC[i], returns <INPUT> if <INPUT> does not match any <SRC>
 
 Examples:
     --field example.Publisher.name:B \\
@@ -54,12 +62,19 @@ Examples:
     --field example.Author.2.first_name:E \\
     --field +example.Author.2.email:F \\
     --field example.Book.title:A \\
-    --field 'example.Book.publisher:B|ref(example.Publisher.name)'
+    --field 'example.Book.publisher:ref("example.Publisher", name=B)'
 """,
         )
         parser.add_argument(
             "--sheet",
             help="Specify which sheet to use. Can be a 1-base index or the name of sheet. The default is the first sheet in the excel file.",
+        )
+        parser.add_argument(
+            "-y",
+            "--yes",
+            action="store_true",
+            default=False,
+            help="Do not ask for confirmation of the data to import",
         )
 
     def handle(self, *args, **options):
@@ -87,13 +102,11 @@ Examples:
             for fieldarg in options["field"]:
                 fieldspec, valueexpr = fieldarg.split(":", 1)
                 app_model, field = fieldspec.rsplit(".", 1)
-                is_natural_key = app_model.startswith("+")
+                is_natural_key = app_model.startswith("*")
                 app_model = app_model[1:] if is_natural_key else app_model
                 app_label, modelname = app_model.split(".", 1)
                 if app_model not in modeldefinitions:
                     modeldefinitions[app_model] = {
-                        "created": 0,  # for status output
-                        "processed": 0,  # for status output
                         "model": apps.get_model(app_label, modelname.split(".", 1)[0]),
                         "fields": {},
                     }
@@ -115,22 +128,63 @@ Examples:
                 for f in modeldefinitions[model]["fields"].values():
                     f["is_natural_key"] = True
 
+        errors = []
         with transaction.atomic():
             for r in rowranges:
                 for row in worksheet.iter_rows(min_row=r[0], max_row=r[1]):
-                    print(row)
                     rowcontext = {
                         get_column_letter(i): c.value for i, c in enumerate(row, 1)
                     }
+                    # strip whitespace from strings
+                    for col in rowcontext:
+                        if isinstance(rowcontext[col], str):
+                            rowcontext[col] = rowcontext[col].strip()
+                    objects = []
                     for model in model_import_order(modeldefinitions):
-                        created = importinstance(modeldefinitions[model], rowcontext)
-                        modeldefinitions[model]["processed"] += 1
-                        if created:
-                            modeldefinitions[model]["created"] += 1
-        for model in modeldefinitions:
-            print(f"{model}:")
-            print(f"  {modeldefinitions[model]['created']} created")
-            print(f"  {modeldefinitions[model]['processed']} processed")
+                        try:
+                            newversion, oldversion = importinstance(
+                                modeldefinitions[model], rowcontext
+                            )
+                        except IgnoreObject:
+                            pass
+                        if newversion is not None:
+                            objects.append((newversion, oldversion))
+                    print(f"Objects from row {getattr(row[0], 'row', '??')}:")
+                    for newversion, oldversion in objects:
+                        newdict = model_to_dict(newversion)
+                        changes = newdict
+                        # simple object diff
+                        if oldversion:
+                            olddict = model_to_dict(oldversion)
+                            changedfields = [
+                                k
+                                for k in (olddict.keys() ^ newdict.keys())
+                                if newdict[k] != olddict[k]
+                            ]
+                            changes = ""
+                            if changedfields:
+                                changes += str({k: newdict[k] for k in changedfields})
+                            if olddict.keys() - newdict.keys():
+                                changes += (
+                                    f" removed: {olddict.keys() - newdict.keys()}"
+                                )
+                            if newdict.keys() - olddict.keys():
+                                changes += f" added: {newdict.keys() - olddict.keys()}"
+                        if changes:
+                            print(
+                                f"    {newversion} ({'new' if not oldversion else 'updated'}) {changes}"
+                            )
+                        else:
+                            print(f"    No changes for {newversion}")
+            if "yes" not in options:
+                do = input("Do you want to save the import? [Y/n] ")
+                if do.lower() not in ["", "y"]:
+                    raise Exception("Import cancelled by user")
+
+        if errors:
+            print("Errors:")
+            for error in errors:
+                print(f"  {error}")
 
 
 def importinstance(model, rowcontext):
@@ -139,19 +193,49 @@ def importinstance(model, rowcontext):
         for f in model["fields"].values()
         if f["is_natural_key"]
     }
+    if not all(naturalkey_values.values()):
+        return None, False
     default_values = {
         f["modelfield"].name: _extract_fieldvalue(f, rowcontext)
         for f in model["fields"].values()
         if not f["is_natural_key"]
+        and not isinstance(
+            f["modelfield"],
+            (models.fields.reverse_related.ForeignObjectRel, GenericRelation),
+        )
     }
-    print(default_values, naturalkey_values)
-    return model["model"].objects.update_or_create(
+    oldobject = model["model"].objects.filter(**naturalkey_values).first()
+    newobject, _ = model["model"].objects.update_or_create(
         defaults=default_values, **naturalkey_values
-    )[1]
+    )
+    for f in model["fields"].values():
+        if isinstance(
+            f["modelfield"],
+            (models.fields.reverse_related.ForeignObjectRel, GenericRelation),
+        ):
+            object_list = _extract_fieldvalue(f, rowcontext)
+            if object_list:
+                newobject.save()
+                if isinstance(object_list[0], models.Model):
+                    getattr(newobject, f["modelfield"].name).add(
+                        *object_list, bulk=False
+                    )
+                else:
+                    for args in object_list:
+                        # poor duplication detection...
+                        obj = (
+                            getattr(newobject, f["modelfield"].name)
+                            .filter(**args)
+                            .first()
+                        )
+                        if not obj:
+                            getattr(newobject, f["modelfield"].name).create(**args)
+
+    return newobject, oldobject
 
 
 def _extract_fieldvalue(field, rowcontext):
-    return eval(field["expression"], {}, rowcontext)
+    return eval(field["expression"], {"ref": ref, "vmap": vmap}, rowcontext)
 
 
 def combine_ranges(ranges):
@@ -163,6 +247,7 @@ def combine_ranges(ranges):
             combined.append(r)
         elif r[1] > combined[-1][1]:
             combined[-1][1] = r[1]
+    return combined
 
 
 def range_overlap(start1, end1, start2, end2):
@@ -184,17 +269,8 @@ def range_overlap(start1, end1, start2, end2):
 
 
 def model_import_order(modeldefinitions):
-    if has_dependency_cycle(modeldefinitions):
-        raise ImproperlyConfigured(
-            "The import definition contains a cycle of foreign keys which is not allowed"
-        )
-    # TODO: implement
+    # TODO: automatically detect correct order to satisfy all uses of "ref" (referenced objects in the same line should be created before their referers)
     return modeldefinitions.keys()
-
-
-def has_dependency_cycle(modeldefinitions):
-    # TODO: implement
-    return False
 
 
 def try_int(v, default=None):
@@ -202,3 +278,23 @@ def try_int(v, default=None):
         return int(v)
     except (TypeError, ValueError):
         return v if default is None else default
+
+
+# transformation functions ------------------------------------------------------
+
+
+def ref(modelname, **kwargs):
+    return apps.get_model(*modelname.split(".")).objects.filter(**kwargs).first()
+
+
+def noempty(value):
+    if value == "":
+        raise IgnoreObject()
+    return value
+
+
+def vmap(_input, *mappings):
+    for key, value in mappings:
+        if _input == key:
+            return value
+    return _input
